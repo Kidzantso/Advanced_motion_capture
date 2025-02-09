@@ -1,6 +1,7 @@
 from flask import Blueprint, request, jsonify
 from controllers.pose_controller import PoseController
 import tempfile
+import os
 
 pose_bp = Blueprint("pose", __name__)
 pose_controller = PoseController()  # Create a single instance of PoseController
@@ -26,24 +27,30 @@ def save_temp_video(video):
     
 @pose_bp.route("/process-video", methods=["POST"])
 def process_video_route():
-    video = request.files.get("video")
-
-    # Validate the video file
-    print("Validating video file...")
-    is_valid, error_message = validate_video_file(video, request.files)
-    if not is_valid:
-        return jsonify({"success": False, "error": error_message}), 400
-
     try:
+        video = request.files.get("video")
+
+        # Validate the video file
+        print("Validating video file...")
+        is_valid, error_message = validate_video_file(video, request.files)
+        if not is_valid:
+            return jsonify({"success": False, "error": error_message}), 400
+
         # Save the file temporarily
         print("Saving the video file temporarily...")
         temp_video_path = save_temp_video(video)
 
         # Process the video
         print("Processing the video...")
-        # response = pose_controller.process_video(temp_video_path)
         response = pose_controller.multiple_human_segmentation(temp_video_path)
+
+        # Clean up the temporary file if it still exists
+        if os.path.exists(temp_video_path):
+            os.remove(temp_video_path)
 
         return response
     except Exception as e:
+        # Clean up in case of error
+        if 'temp_video_path' in locals() and os.path.exists(temp_video_path):
+            os.remove(temp_video_path)
         return jsonify({"success": False, "error": str(e)}), 500

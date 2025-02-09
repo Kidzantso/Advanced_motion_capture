@@ -34,3 +34,4 @@ class OpenPoseEstimator(Estimator2D):
             keypoints_list.append(datum.poseKeypoints)
 
         return keypoints_list
+        

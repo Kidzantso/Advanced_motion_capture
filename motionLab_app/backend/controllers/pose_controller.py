@@ -48,53 +48,32 @@ OPENPOSE_CONNECTIONS_25 = [
     (22, 23),    
 ]
 
-class PoseController:
-    def __init__(self, config_file='utils/video_pose.yaml', checkpoint_file='utils/best_58.58.pth'):
-        
-        self.mediapipe_to_openpose = {
-            0: 0, 11: 5, 12: 2, 13: 6, 14: 3, 
-            # 13: 5, # 14: 2, # 15: 6, # 16: 3, 
-            17: 7, 18: 4, 23: 12,  24: 9,  
-            25: 13,  26: 10, 27: 14,
-            28: 11, 31: 20, 32: 23, 29: 19, 30: 22, 
-            2: 16, 5: 15, 7: 18, 8: 17,
-        }
-        
-        self.img_width = 0
-        self.img_height = 0
-        self.fps = 30
-        
-        # YOLO model initialization
-        # self.yolo_model = YOLO('yolov8n-pose.pt')
-        
-        # 2D Pose detector initialization
+class MediaPipeDetector:
+    def __init__(self):
         self.mp_pose = mp.solutions.pose
         self.pose = self.mp_pose.Pose()
         
-        # 3D Pose Estimator initialization
-        self.estimator_3d = self._initialize_3D_pose_estimator(config_file, checkpoint_file)
+        self.mediapipe_to_openpose = {
+            0: 0, 11: 5, 12: 2, 13: 6, 14: 3, 
+            17: 7, 18: 4, 23: 12, 24: 9,  
+            25: 13, 26: 10, 27: 14,
+            28: 11, 31: 20, 32: 23, 29: 19, 30: 22, 
+            2: 16, 5: 15, 7: 18, 8: 17,
+        }
 
-    # 3D Pose Estimator initialization
-    def _initialize_3D_pose_estimator(self, config_file, checkpoint_file):
-        try:
-            temp = pathlib.PosixPath
-            pathlib.PosixPath = pathlib.WindowsPath
-
-            importlib.reload(estimator_3d)
-
-            e3d = estimator_3d.Estimator3D(config_file=config_file, checkpoint_file=checkpoint_file)
-
-            pathlib.PosixPath = temp
-            return e3d
-        except Exception as e:
-            raise RuntimeError(f"Error initializing Estimator3D: {e}")
-
-    # Interpolate joints
     @staticmethod
     def interpolate_joint(lm1, lm2):
         return [(lm1.x + lm2.x) / 2, (lm1.y + lm2.y) / 2, (lm1.z + lm2.z) / 2]
 
-    # Function to draw keypoints on the frame
+    def detect_pose(self, frame):
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        return self.pose.process(rgb_frame)
+
+    def process_landmarks(self, detection_result, img_width, img_height):
+        # Process landmarks and return keypoints
+        pass
+
+class PoseVisualizer:
     @staticmethod
     def draw_openpose_keypoints(frame, keypoints):
         for i, (x, y, _) in enumerate(keypoints):
@@ -107,8 +86,134 @@ class PoseController:
             cv2.line(frame, (int(joint1[0]), int(joint1[1])), (int(joint2[0]), int(joint2[1])), (0, 255, 0), 2)
         
         return frame
-    
-    # Align and scale 3D pose
+
+    def visualize_3D_points(self, points_3d, connections=None):
+        fig = plt.figure()
+        ax = fig.add_subplot(111, projection='3d')        
+        points_3d_numpy = np.array(points_3d)
+        x_max, y_max, z_max = np.max(points_3d_numpy[:, :, 0]), np.max(points_3d_numpy[:, :, 1]), np.max(points_3d_numpy[:, :, 2])
+
+        up_limit = max(abs(x_max), abs(y_max), abs(z_max))
+        down_limit = -up_limit
+
+        for point in points_3d:
+            ax.clear()
+            x = point[:, 0]
+            y = point[:, 1]
+            z = point[:, 2]
+
+            ax.scatter(x, -z, -y)
+
+            for connection in connections:
+                idx1, idx2 = connection
+                ax.plot([x[idx1], x[idx2]], [-z[idx1], -z[idx2]], [-y[idx1], -y[idx2]], color='black')
+
+            ax.set_xlim(down_limit, up_limit)
+            ax.set_ylim(down_limit, up_limit)
+            ax.set_zlim(down_limit, up_limit)
+
+            ax.set_xlabel('X-axis')
+            ax.set_ylabel('Y-axis')
+            ax.set_zlabel('Z-axis')
+
+            plt.pause(0.01)
+            plt.show(block=False)
+
+class VideoProcessor:
+    def __init__(self):
+        self.yolo_model = None
+        self.output_video_paths = []
+        self.img_width = 0
+        self.img_height = 0
+        self.fps = 30
+
+    def _open_video(self, file_path):
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Video file not found: {file_path}")
+
+        cap = cv2.VideoCapture(file_path)
+        if not cap.isOpened():
+            raise ValueError(f"Unable to open video file: {file_path}")
+        self.fps = cap.get(cv2.CAP_PROP_FPS)
+        return cap
+
+    def _initialize_video_writer(self, person_id, output_folder, img_width, img_height, fps):
+        output_video_path = os.path.join(output_folder, f'person_{person_id}.mp4')
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        writer = cv2.VideoWriter(output_video_path, fourcc, fps, (img_width, img_height))
+        return writer, output_video_path
+
+    def _process_YOLO_frame(self, writers, frame, output_folder, tracker_path, img_width, img_height, fps):
+        try:            
+            results = self.yolo_model.track(frame, persist=True, tracker=tracker_path)
+            
+            for result in results:
+                boxes = result.boxes.xyxy
+                labels = result.boxes.cls
+                confidences = result.boxes.conf
+                
+                if len(boxes) == 0:
+                    continue
+                
+                for i, box in enumerate(boxes):
+                    x1, y1, x2, y2 = box
+                    confidence = confidences[i]
+                    
+                    bbox_area = abs(x2 - x1) * abs(y2 - y1)
+                    image_area = img_width * img_height
+
+                    if bbox_area < 0.05 * image_area:
+                        continue
+                    
+                    if labels[i] == 0 and confidence > 0.7:
+                        black_background = np.zeros_like(frame)
+                        person_frame = frame[int(y1):int(y2), int(x1):int(x2)]
+                        black_background[int(y1):int(y2), int(x1):int(x2)] = person_frame
+                        person_id = int(result.boxes.id[i])
+                        
+                        if person_id not in writers:
+                            writers[person_id], output_video_path = self._initialize_video_writer(
+                                person_id, output_folder, img_width, img_height, fps
+                            )
+                            self.output_video_paths.append(output_video_path)
+                            
+                        writers[person_id].write(black_background)
+            
+        except Exception as e:
+            print(f"Error in _process_YOLO_frame: {e}")
+            raise RuntimeError(f"Error in _process_YOLO_frame: {e}")
+
+    def process_video_frames(self, video_path, frame_processor):
+        cap = self._open_video(video_path)
+        frames_data = []
+        
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+                
+            self.img_height, self.img_width = frame.shape[:2]
+            frame_data = frame_processor(frame)
+            frames_data.append(frame_data)
+
+        cap.release()
+        return frames_data, self.img_width, self.img_height, self.fps
+
+class PoseEstimator3D:
+    def __init__(self, config_file='utils/video_pose.yaml', checkpoint_file='utils/best_58.58.pth'):
+        self.estimator_3d = self._initialize_3D_pose_estimator(config_file, checkpoint_file)
+
+    def _initialize_3D_pose_estimator(self, config_file, checkpoint_file):
+        try:
+            temp = pathlib.PosixPath
+            pathlib.PosixPath = pathlib.WindowsPath
+            importlib.reload(estimator_3d)
+            e3d = estimator_3d.Estimator3D(config_file=config_file, checkpoint_file=checkpoint_file)
+            pathlib.PosixPath = temp
+            return e3d
+        except Exception as e:
+            raise RuntimeError(f"Error initializing Estimator3D: {e}")
+
     @staticmethod
     def align_and_scale_3d_pose(pose_3d):
         rotation_matrix_x = np.array([
@@ -117,12 +222,37 @@ class PoseController:
             [0,  0, -1]   
         ])
         pose_3d = np.einsum('ij,klj->kli', rotation_matrix_x, pose_3d)
-
         min_y = np.min(pose_3d[:, :, 1])
         pose_3d[:, :, 1] += -min_y
-
         pose_3d *= 0.025
         return pose_3d
+
+class PoseController:
+    def __init__(self, config_file='utils/video_pose.yaml', checkpoint_file='utils/best_58.58.pth'):
+        self.mediapipe_detector = MediaPipeDetector()
+        self.pose_visualizer = PoseVisualizer()
+        self.video_processor = VideoProcessor()
+        self.pose_estimator_3d = PoseEstimator3D(config_file, checkpoint_file)
+        
+        self.mediapipe_to_openpose = {
+            0: 0, 11: 5, 12: 2, 13: 6, 14: 3, 
+            17: 7, 18: 4, 23: 12,  24: 9,  
+            25: 13,  26: 10, 27: 14,
+            28: 11, 31: 20, 32: 23, 29: 19, 30: 22, 
+            2: 16, 5: 15, 7: 18, 8: 17,
+        }
+        
+        self.img_width = 0
+        self.img_height = 0
+        self.fps = 30
+        
+        self.mp_pose = mp.solutions.pose
+        self.pose = self.mp_pose.Pose()
+
+    # Interpolate joints
+    @staticmethod
+    def interpolate_joint(lm1, lm2):
+        return [(lm1.x + lm2.x) / 2, (lm1.y + lm2.y) / 2, (lm1.z + lm2.z) / 2]
 
     # Open the video file and validate it
     def _open_video(self, file_path):
@@ -139,8 +269,6 @@ class PoseController:
     def _process_frame(self, frame, visualize = False):
         try:
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            # mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-            # detection_result = self.pose_detector.detect(mp_image)
             detection_result = self.pose.process(rgb_frame)
 
             keypoints = np.zeros((25, 3))
@@ -149,8 +277,6 @@ class PoseController:
             if detection_result.pose_landmarks:
                 landmarks = detection_result.pose_landmarks.landmark
                 landmarks_list.append(landmarks)
-                # landmarks = detection_result.pose_world_landmarks.landmark
-
                 pose_world_landmarks = detection_result.pose_world_landmarks.landmark
 
                 for mp_idx, openpose_idx in self.mediapipe_to_openpose.items():
@@ -182,7 +308,7 @@ class PoseController:
             
             ## Draw keypoints
             if visualize:
-                frame_with_keypoints = self.draw_openpose_keypoints(frame, keypoints)
+                frame_with_keypoints = self.pose_visualizer.draw_openpose_keypoints(frame, keypoints)
 
                 # Show the frame
                 if self.img_height > 500:
@@ -225,7 +351,7 @@ class PoseController:
     def _estimate_3d_from_2d(self, keypoints_list):
         try:
             pose2d = np.stack(keypoints_list)[:, :, :2]
-            return self.estimator_3d.estimate(pose2d, image_width=self.img_width, image_height=self.img_height)
+            return self.pose_estimator_3d.estimator_3d.estimate(pose2d, image_width=self.img_width, image_height=self.img_height)
         except Exception as e:
             raise RuntimeError(f"Error in _estimate_3d_from_2d: {e}")
 
@@ -249,38 +375,6 @@ class PoseController:
             print(f"Error in _convert_3d_to_bvh: {e}")
             raise RuntimeError(f"Error in _convert_3d_to_bvh: {e}")
         
-    def _visualize_3D_points(self, points_3d, connections=None):
-        fig = plt.figure()
-        ax = fig.add_subplot(111, projection='3d')        
-        points_3d_numpy = np.array(points_3d)
-        x_max, y_max, z_max = np.max(points_3d_numpy[:, :, 0]), np.max(points_3d_numpy[:, :, 1]), np.max(points_3d_numpy[:, :, 2])
-
-        up_limit = max(abs(x_max), abs(y_max), abs(z_max))
-        down_limit = -up_limit
-
-        for point in points_3d:
-            ax.clear()
-            x = point[:, 0]  # Extract X coordinates
-            y = point[:, 1]  # Extract Y coordinates
-            z = point[:, 2]  # Extract Z coordinates
-
-            ax.scatter(x, -z, -y)
-
-            for connection in connections:
-                idx1, idx2 = connection
-                ax.plot([x[idx1], x[idx2]], [-z[idx1], -z[idx2]], [-y[idx1], -y[idx2]], color='black')
-
-            ax.set_xlim(down_limit, up_limit)
-            ax.set_ylim(down_limit, up_limit)
-            ax.set_zlim(down_limit, up_limit)
-
-            ax.set_xlabel('X-axis')
-            ax.set_ylabel('Y-axis')
-            ax.set_zlabel('Z-axis')
-
-            plt.pause(0.01)
-            plt.show(block=False)
-            
     def _get_root_keypoints(self, landmarks_list):
         root_keypoints = []
 
@@ -325,25 +419,18 @@ class PoseController:
     # Process the video file
     def process_video(self, temp_video_path):        
         try:
-            cap = self._open_video(temp_video_path)
+            cap = self.video_processor._open_video(temp_video_path)
+            self.fps = self.video_processor.fps
             
             keypoints, pose_world_keypoints, landmarks_list = self._get_keypoints_list(cap, visualize=False)
             
             root_keypoints = self._get_root_keypoints(landmarks_list)
                         
-            # self._visualize_3D_points(pose_world_keypoints, connections=OPENPOSE_CONNECTIONS_25)
             points_3d = self._estimate_3d_from_2d(keypoints)
 
-            corrected_3d_points = self.align_and_scale_3d_pose(points_3d)
+            corrected_3d_points = self.pose_estimator_3d.align_and_scale_3d_pose(points_3d)
             
-            # self._visualize_3D_points(corrected_3d_points, connections=CMU_CONNECTIONS)
-            
-            bvh_filename =  self._convert_3d_to_bvh(corrected_3d_points, root_keypoints)
-            
-            # return jsonify({
-            #     "success": True,
-            #     "bvh_filename": bvh_filename,
-            # }), 200
+            bvh_filename = self._convert_3d_to_bvh(corrected_3d_points, root_keypoints)
             
             return bvh_filename
         except Exception as e:
@@ -351,21 +438,16 @@ class PoseController:
             return jsonify({"success": False, "error": str(e)}), 500
         finally:
             if temp_video_path and os.path.exists(temp_video_path):
-                os.remove(temp_video_path)  # Ensure file cleanup
+                os.remove(temp_video_path)
 
     def multiple_human_segmentation(self, video_path):
-        
         try:
-            # self.yolo_model = YOLO('yolo11m-pose.pt')
-            self.yolo_model = YOLO('yolo11s-pose.pt')
-            # self.yolo_model = YOLO('yolo11n.pt')
+            self.video_processor.yolo_model = YOLO('yolo11s-pose.pt')
             writers = {}
-            self.output_video_paths = []
-            # Create an output folder
             output_folder = 'output_videos'
             
-            cap = self._open_video(video_path)
-            
+            cap = self.video_processor._open_video(video_path)
+            self.fps = self.video_processor.fps
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             
             pathlib.Path(output_folder).mkdir(parents=True, exist_ok=True)
@@ -376,8 +458,13 @@ class PoseController:
                     break
                 
                 self.img_height, self.img_width = frame.shape[:2]
+                self.video_processor.img_height = self.img_height
+                self.video_processor.img_width = self.img_width
                 
-                self._process_YOLO_frame(writers, frame, output_folder, "utils/bytetrack.yaml")
+                self.video_processor._process_YOLO_frame(
+                    writers, frame, output_folder, "utils/bytetrack.yaml", 
+                    self.img_width, self.img_height, self.fps
+                )
             
             cap.release()
             for writer in writers.values():
@@ -387,7 +474,7 @@ class PoseController:
             
             bvh_filenames = []
             
-            for video_path in self.output_video_paths:
+            for video_path in self.video_processor.output_video_paths:
                 cap = cv2.VideoCapture(video_path)
                 frames_num = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
                 cap.release()
@@ -404,54 +491,5 @@ class PoseController:
             return jsonify({"success": True, "bvh_filenames": bvh_filenames}), 200
             
         except Exception as e:
-            print(f"Error in _multiple_human_segmentation: {e}")
+            print(f"Error in multiple_human_segmentation: {e}")
             return jsonify({"success": False, "error": str(e)}), 500
-        
-    def _process_YOLO_frame(self, writers, frame, output_folder, tracker_path):
-        try:            
-            
-            results = self.yolo_model.track(frame, persist = True, tracker = tracker_path)
-            
-            for result in results:
-                boxes = result.boxes.xyxy
-                labels = result.boxes.cls
-                confidences = result.boxes.conf
-                
-                if len(boxes) == 0:
-                    continue
-                
-                for i, box in enumerate(boxes):
-                    x1, y1, x2, y2 = box
-                    confidence = confidences[i]
-                    
-                    bbox_area = abs(x2 - x1) * abs(y2 - y1)  # Compute bounding box area
-                    image_area = self.img_width * self.img_height  # Total image area
-
-                    if bbox_area < 0.05 * image_area:  # Adjust the threshold as needed
-                        continue
-                    
-                    if labels[i] == 0 and confidence > 0.7:
-                        black_background = np.zeros_like(frame)
-                        person_frame = frame[int(y1):int(y2), int(x1):int(x2)]  # Crop the person
-                        black_background[int(y1):int(y2), int(x1):int(x2)] = person_frame  # Paste on black background
-                        person_id = int(result.boxes.id[i])  # Get tracking ID
-                        
-                        if person_id not in writers:
-                            writers[person_id], output_video_path = self._initialize_video_writer(person_id, output_folder)
-                            self.output_video_paths.append(output_video_path)
-                            
-                        # Write the processed frame to the corresponding VideoWriter object
-                        writers[person_id].write(black_background)
-            
-        except Exception as e:
-            print(f"Error in _process_YOLO_frame: {e}")
-            raise RuntimeError(f"Error in _process_YOLO_frame: {e}")
-                    
-    def _initialize_video_writer(self, person_id, output_folder):
-        """
-        Initializes a VideoWriter object for the given person_id.
-        """
-        output_video_path = os.path.join(output_folder, f'person_{person_id}.mp4')
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        writer = cv2.VideoWriter(output_video_path, fourcc, self.fps, (self.img_width, self.img_height))
-        return writer, output_video_path
